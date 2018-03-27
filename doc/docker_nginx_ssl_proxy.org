@@ -1,0 +1,161 @@
+#+BLOG: dasmaeh.de
+#+POSTID: 7182
+#+DATE: [2018-02-24 Sa 20:25]
+#+TITLE: Automated reverse HTTP and HTTPS proxy on docker with nginx
+#+CATEGORY: Cloud
+#+TAGS: docker, nginx, letsencrypt
+#+PERMALINK: automated-reverse-proxy-docker-nginx
+
+Usually the host server has only one fixed IP. So all domains of all your dockerized services get resolved to the same IP. Somehow the server needs to know, how to route all the requests and responses to correct app. On a "normal" webserver you would be using virtual hosts to direct the traffic to the correct page. On a docker host things are a bit more complex, as each dockerized app is using it's own webserver. So we'll need a reverse proxy to route the traffic. 
+#+HTML: <!--more-->
+For only a few apps you could configure the proxy manually.  The more apps you run on docker, the more complex this task will become. Of course only requests for apps that are actually running should be routed. So it would be great to have an automated reverse proxy. Fortunately it exists. It's using nginx as webserver and then automatically adds the proxying when your app is started. And it removes the config again when your app gets stopped. 
+It can even do more: it can take of SSL/TLS encryption automatically. The nginx proxy composition automatically obtains a certificate for your app from [[https://letsencrypt.org][letsencrypt]] 
+#+HTML: &trade;<sup><a href="#fn1" id="ref1">1)</a></sup> 
+. The certificates also get renewed automatically of. All traffic between the client and the proxy will be encrypted then. The (internal) traffic between the proxy and the app won't be encrypted. That's not bad as this is local traffic on your server. Anybody having access to that traffic will also having access to the file system and the server anyway.
+
+* Compose file
+I prefer using ~docker-compose~ to tie multiple containers together to an application. This is my =docker-compose.yml= for the reverse proxy:
+#+BEGIN_SRC text :syntaxhl title="/docker/nginx_proxy/docker-compose.yml"
+version: "2"
+
+services:
+    # The webserver facing outside and doing the redirects
+    nginx:
+        container_name: nginx
+        image: nginx
+        ports:
+            - 80:80
+            - 443:443
+        volumes:
+            - ./conf.d:/etc/nginx/conf.d
+            - ./vhost.d:/etc/nginx/vhost.d
+            - ./html:/usr/share/nginx/html
+            - /docker/ssl:/etc/nginx/certs:ro
+        networks:
+            - outside
+        labels:
+            -com.github.jrcs.letsencrypt_nginx_proxy_companion.nginx_proxy: "true"
+
+
+    # The magic part: creating configs and redirects automatically from docker container configs
+    docker_gen:
+        image: jwilder/docker-gen
+        container_name: nginx-gen
+        depends_on: 
+            - nginx
+        volumes_from: 
+            - nginx
+        volumes:
+            - /var/run/docker.sock:/tmp/docker.sock:ro
+            - ./template/nginx.tmpl:/etc/docker-gen/templates/nginx.tmpl:ro
+        links:
+            - nginx
+        networks:
+            - outside
+
+        command: "-notify-sighup nginx -watch -wait 5s:30s /etc/docker-gen/templates/nginx.tmpl /etc/nginx/conf.d/default.conf"
+
+    # More magic: automatical creation and renewal of certificates for all services
+    letsencrypt:
+        image: jrcs/letsencrypt-nginx-proxy-companion
+        container_name: nginx_letsencrypt
+        environment:
+            - NGINX_DOCKER_GEN_CONTAINER=nginx-gen
+        volumes_from: 
+            - nginx
+        volumes:
+            - /docker/ssl:/etc/nginx/certs:rw
+            - /var/run/docker.sock:/var/run/docker.sock:ro
+        networks:
+            - inside
+
+networks:
+    inside:
+    outside:
+        external:
+            name: proxy-tier
+#+END_SRC
+You can find my complete config on [[https://github.com/dasmaeh/docker_nginx_proxy][github]].
+* Directories
+=/docker/nginx_proxy=
+- =/conf.d= storing the configuration
+- =/html= storing static websites or parts
+- =/template= storing the configuration template for apps
+- =/vhost.d= storing domain/virtual host specific configurations
+=/docker/ssl= for the SSL/TLS certificates.
+* Installation
+Pretty easy. Just do a 
+#+BEGIN_SRC bash
+docker-compose pull
+#+END_SRC
+to install all the docker images.
+* Configuration
+There is not much do as most of it will happen automatically. Besides creating the directories you will have to download the configuration template:
+#+BEGIN_SRC bash
+curl https://raw.githubusercontent.com/jwilder/docker-gen/master/templates/nginx.tmpl > /docker/nginx_proxy/template/nginx.tmpl
+#+END_SRC
+And you'll need to create a new internal network in docker. This will be the shared private network for all apps and the proxy server.
+#+BEGIN_SRC bash
+docker network create proxy-tier
+#+END_SRC
+ 
+Now you already test the automated reverse proxy and start it manually:
+#+BEGIN_SRC bash
+cd /docker/nginx_proxy
+docker-compose up
+#+END_SRC
+* Systemd unit file
+  To run the automated reverse proxy in the background and have it start at system boot I use a system unit file:
+#+BEGIN_SRC text :syntaxgl title="/etc/systemd/system/docker-nginx-proxy.service
+[Unit]
+Description=docker nginx for proxying
+After=docker.service
+Requires=docker.service
+
+
+[Service]
+Restart=Always
+# Stop and remove old containers:
+ExecStartPre=/usr/bin/docker-compose -f /docker/nginx_proxy/docker-compose.yml down -v
+ExecStartPre=/usr/bin/docker-compose -f /docker/nginx_proxy/docker-compose.yml rm -fv
+
+# Start the container
+ExecStart=/usr/bin/docker-compose -f /docker/nginx_proxy/docker-compose.yml up
+
+# Stop the container
+ExecStop=/usr/bin/docker-compose -f /docker/nginx_proxy/docker-compose.yml down -v
+
+[Install]
+WantedBy=docker.service
+#+END_SRC
+Now I can start the composition by
+#+BEGIN_SRC bash
+sudo systemctl start docker-nginx-proxy.service
+#+END_SRC
+and enable automatic start at system boot by
+#+BEGIN_SRC bash
+sudo systemctl enable docker-nginx-proxy.service
+#+END_SRC
+
+* Usage example
+Lets take an arbitary app called 'dummy' as an example. Starting the app like this
+#+BEGIN_SRC bash
+docker run --env "VIRTUAL_HOST=dummy.domain.tld" --env "LETSENCRYPT_HOST=dummy.domain.tld" --env "LETSENCRYPT_EMAIL=admin@domain.tld" dummy
+#+END_SRC
+will do all the magic. The proxy configuration will be created automatically, so you can reach the app at http://dummy.domain.tld. After some minutes the certificates will have been generated and alltraffic will redirected to the encrypted address https://dummy.domain.tld.
+Of course you also use the same environment variables in a docker-compose script.
+
+* Github repository
+https://github.com/dasmaeh/docker_nginx_proxy
+* References
+- [[https://github.com/JrCs/docker-letsencrypt-nginx-proxy-companion]]
+- https://github.com/dasmaeh/docker_nginx_proxy
+- [[https://hub.docker.com/_/nginx/]]
+- [[https://github.com/nginxinc/docker-nginx]]
+- [[https://hub.docker.com/r/jwilder/docker-gen/]]
+- [[https://github.com/jwilder/docker-gen]]
+- [[https://hub.docker.com/r/jrcs/letsencrypt-nginx-proxy-companion/]]
+- [[https://github.com/JrCs/docker-letsencrypt-nginx-proxy-companion]]
+
+#+HTML: <hr></hr>
+#+HTML:  <sup id="fn1">1 [letsencrypt is a trademark of the Internet Security Research Group. All rights reserved.]<a href="#ref1" id="ref1" title="Jump back to reference in text">&uarr;</a></sup>
