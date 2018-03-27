@@ -1,2 +1,4 @@
-/conf.d/nextcloud.conf
-/html/.well-known
+conf.d/default.conf
+conf.d/nextcloud.conf
+html/.well-known
+vhost.d/collabora
